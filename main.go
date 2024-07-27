@@ -84,14 +84,22 @@ type imuxConn struct {
 }
 
 func (c *Client) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return c.dialIMUXConn(ctx, network, destination), nil
+}
+
+func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return &imuxPacketConn{
+		imuxConn: c.dialIMUXConn(ctx, "udp", destination),
+	}, nil
+}
+
+func (c *Client) dialIMUXConn(ctx context.Context, network string, destination M.Socksaddr) *imuxConn {
 	conns := make([]net.Conn, c.maxConnections)
 	for i := 0; i < c.maxConnections; i++ {
 		conn, err := c.dialer.DialContext(ctx, network, destination)
 		if err != nil {
-			for j := 0; j < i; j++ {
-				conns[j].Close()
-			}
-			return nil, err
+			c.logger.Error("failed to dial connection:", err)
+			continue
 		}
 		conns[i] = conn
 	}
@@ -108,11 +116,13 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 	}
 
 	for i := 0; i < c.maxConnections; i++ {
-		go imuxConn.readRoutine(i)
-		go imuxConn.writeRoutine(i)
+		if conns[i] != nil {
+			go imuxConn.readRoutine(i)
+			go imuxConn.writeRoutine(i)
+		}
 	}
 
-	return imuxConn, nil
+	return imuxConn
 }
 
 func (c *imuxConn) readRoutine(index int) {
@@ -223,7 +233,9 @@ func (c *imuxConn) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closeChan)
 		for _, conn := range c.conns {
-			conn.Close()
+			if conn != nil {
+				conn.Close()
+			}
 		}
 	})
 	return nil
@@ -235,7 +247,19 @@ func (c *imuxConn) SetDeadline(t time.Time) error      { return nil }
 func (c *imuxConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *imuxConn) SetWriteDeadline(t time.Time) error { return nil }
 
-// Dummy implementations to satisfy the original interface
+type imuxPacketConn struct {
+	*imuxConn
+}
+
+func (c *imuxPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, err = c.imuxConn.Read(p)
+	return n, c.imuxConn.RemoteAddr(), err
+}
+
+func (c *imuxPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	return c.imuxConn.Write(p)
+}
+
 func (c *Client) Reset()       {}
 func (c *Client) Close() error { return nil }
 
@@ -271,7 +295,6 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.M
 
 var Destination = M.Socksaddr{Fqdn: "inverse-mux"}
 
-// Dummy structs and constants to satisfy the original package
 const (
 	ProtocolH2Mux = iota
 	ProtocolSmux
