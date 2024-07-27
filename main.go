@@ -3,13 +3,13 @@ package mux
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -23,7 +23,6 @@ const (
 
 type Client struct {
 	dialer         N.Dialer
-	logger         logger.Logger
 	maxConnections int
 	minStreams     int
 	maxStreams     int
@@ -34,8 +33,6 @@ type Client struct {
 
 type Options struct {
 	Dialer         N.Dialer
-	Logger         logger.Logger
-	Protocol       string
 	MaxConnections int
 	MinStreams     int
 	MaxStreams     int
@@ -47,22 +44,6 @@ type BrutalOptions struct {
 	Enabled    bool
 	SendBPS    uint64
 	ReceiveBPS uint64
-}
-
-func NewClient(options Options) (*Client, error) {
-	if options.MaxConnections <= 0 {
-		options.MaxConnections = defaultMaxConnections
-	}
-	return &Client{
-		dialer:         options.Dialer,
-		logger:         options.Logger,
-		maxConnections: options.MaxConnections,
-		minStreams:     options.MinStreams,
-		maxStreams:     options.MaxStreams,
-		padding:        options.Padding,
-		brutal:         options.Brutal,
-		chunkSize:      defaultChunkSize,
-	}, nil
 }
 
 type chunk struct {
@@ -83,24 +64,45 @@ type imuxConn struct {
 	readBufferMu sync.Mutex
 }
 
+func NewClient(options Options) (*Client, error) {
+	if options.MaxConnections <= 0 {
+		options.MaxConnections = defaultMaxConnections
+	}
+	client := &Client{
+		dialer:         options.Dialer,
+		maxConnections: options.MaxConnections,
+		minStreams:     options.MinStreams,
+		maxStreams:     options.MaxStreams,
+		padding:        options.Padding,
+		brutal:         options.Brutal,
+		chunkSize:      defaultChunkSize,
+	}
+	fmt.Printf("New mux client created with %d max connections\n", options.MaxConnections)
+	return client, nil
+}
+
 func (c *Client) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	fmt.Printf("DialContext called for network: %s, destination: %s\n", network, destination.String())
 	return c.dialIMUXConn(ctx, network, destination), nil
 }
 
 func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	fmt.Printf("ListenPacket called for destination: %s\n", destination.String())
 	return &imuxPacketConn{
 		imuxConn: c.dialIMUXConn(ctx, "udp", destination),
 	}, nil
 }
 
 func (c *Client) dialIMUXConn(ctx context.Context, network string, destination M.Socksaddr) *imuxConn {
+	fmt.Printf("Dialing IMUX connection for network: %s, destination: %s\n", network, destination.String())
 	conns := make([]net.Conn, c.maxConnections)
 	for i := 0; i < c.maxConnections; i++ {
 		conn, err := c.dialer.DialContext(ctx, network, destination)
 		if err != nil {
-			c.logger.Error("failed to dial connection:", err)
+			fmt.Printf("Failed to dial connection: %v, index: %d\n", err, i)
 			continue
 		}
+		fmt.Printf("Successfully dialed connection %d\n", i)
 		conns[i] = conn
 	}
 
@@ -122,16 +124,20 @@ func (c *Client) dialIMUXConn(ctx context.Context, network string, destination M
 		}
 	}
 
+	fmt.Printf("IMUX connection created with %d active connections\n", len(conns))
 	return imuxConn
 }
 
 func (c *imuxConn) readRoutine(index int) {
+	fmt.Printf("Starting read routine for connection %d\n", index)
 	headerBuf := make([]byte, chunkHeaderSize)
 	for {
 		_, err := io.ReadFull(c.conns[index], headerBuf)
 		if err != nil {
 			if err != io.EOF {
-				c.client.logger.Error("read header error:", err)
+				fmt.Printf("Read header error: %v, connection: %d\n", err, index)
+			} else {
+				fmt.Printf("EOF reached for connection %d\n", index)
 			}
 			return
 		}
@@ -139,22 +145,29 @@ func (c *imuxConn) readRoutine(index int) {
 		id := binary.BigEndian.Uint32(headerBuf[:4])
 		length := binary.BigEndian.Uint32(headerBuf[4:])
 
+		fmt.Printf("Received chunk header - ID: %d, Length: %d, Connection: %d\n", id, length, index)
+
 		data := make([]byte, length)
 		_, err = io.ReadFull(c.conns[index], data)
 		if err != nil {
-			c.client.logger.Error("read data error:", err)
+			fmt.Printf("Read data error: %v, connection: %d\n", err, index)
 			return
 		}
 
+		fmt.Printf("Received chunk data - ID: %d, Length: %d, Connection: %d\n", id, len(data), index)
+
 		select {
 		case c.readChan <- chunk{id: id, data: data}:
+			fmt.Printf("Chunk sent to read channel - ID: %d, Connection: %d\n", id, index)
 		case <-c.closeChan:
+			fmt.Printf("Read routine closing for connection %d\n", index)
 			return
 		}
 	}
 }
 
 func (c *imuxConn) writeRoutine(index int) {
+	fmt.Printf("Starting write routine for connection %d\n", index)
 	for {
 		select {
 		case chunk := <-c.writeChan:
@@ -162,24 +175,31 @@ func (c *imuxConn) writeRoutine(index int) {
 			binary.BigEndian.PutUint32(header[:4], chunk.id)
 			binary.BigEndian.PutUint32(header[4:], uint32(len(chunk.data)))
 
+			fmt.Printf("Writing chunk header - ID: %d, Length: %d, Connection: %d\n", chunk.id, len(chunk.data), index)
+
 			_, err := c.conns[index].Write(header)
 			if err != nil {
-				c.client.logger.Error("write header error:", err)
+				fmt.Printf("Write header error: %v, connection: %d\n", err, index)
 				return
 			}
 
 			_, err = c.conns[index].Write(chunk.data)
 			if err != nil {
-				c.client.logger.Error("write data error:", err)
+				fmt.Printf("Write data error: %v, connection: %d\n", err, index)
 				return
 			}
+
+			fmt.Printf("Chunk written successfully - ID: %d, Length: %d, Connection: %d\n", chunk.id, len(chunk.data), index)
+
 		case <-c.closeChan:
+			fmt.Printf("Write routine closing for connection %d\n", index)
 			return
 		}
 	}
 }
 
 func (c *imuxConn) Read(b []byte) (n int, err error) {
+	fmt.Printf("Read called, buffer size: %d\n", len(b))
 	for {
 		c.readBufferMu.Lock()
 		if data, ok := c.readBuffer[c.nextReadID]; ok {
@@ -191,22 +211,26 @@ func (c *imuxConn) Read(b []byte) (n int, err error) {
 				c.nextReadID++
 			}
 			c.readBufferMu.Unlock()
+			fmt.Printf("Read from buffer - ID: %d, Bytes read: %d\n", c.nextReadID-1, n)
 			return
 		}
 		c.readBufferMu.Unlock()
 
 		select {
 		case chunk := <-c.readChan:
+			fmt.Printf("Received chunk from read channel - ID: %d\n", chunk.id)
 			c.readBufferMu.Lock()
 			c.readBuffer[chunk.id] = chunk.data
 			c.readBufferMu.Unlock()
 		case <-c.closeChan:
+			fmt.Printf("Read operation cancelled, connection closed\n")
 			return 0, io.EOF
 		}
 	}
 }
 
 func (c *imuxConn) Write(b []byte) (n int, err error) {
+	fmt.Printf("Write called, data length: %d\n", len(b))
 	remaining := len(b)
 	for remaining > 0 {
 		chunkSize := c.client.chunkSize
@@ -219,21 +243,26 @@ func (c *imuxConn) Write(b []byte) (n int, err error) {
 		}
 		select {
 		case c.writeChan <- chunk:
+			fmt.Printf("Chunk sent to write channel - ID: %d, Length: %d\n", chunk.id, chunkSize)
 			n += chunkSize
 			remaining -= chunkSize
 			c.nextWriteID++
 		case <-c.closeChan:
+			fmt.Printf("Write operation cancelled, connection closed\n")
 			return n, E.New("connection closed")
 		}
 	}
+	fmt.Printf("Write completed, total bytes written: %d\n", n)
 	return n, nil
 }
 
 func (c *imuxConn) Close() error {
+	fmt.Println("Closing IMUX connection")
 	c.closeOnce.Do(func() {
 		close(c.closeChan)
-		for _, conn := range c.conns {
+		for i, conn := range c.conns {
 			if conn != nil {
+				fmt.Printf("Closing sub-connection %d\n", i)
 				conn.Close()
 			}
 		}
@@ -260,37 +289,22 @@ func (c *imuxPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	return c.imuxConn.Write(p)
 }
 
-func (c *Client) Reset()       {}
-func (c *Client) Close() error { return nil }
-
-type Service struct {
-	newStreamContext func(context.Context, net.Conn) context.Context
-	logger           logger.ContextLogger
-	handler          N.TCPConnectionHandler
-	padding          bool
-	brutal           BrutalOptions
+func (c *Client) Reset() {
+	fmt.Println("Resetting mux client")
 }
 
-type ServiceOptions struct {
-	NewStreamContext func(context.Context, net.Conn) context.Context
-	Logger           logger.ContextLogger
-	Handler          N.TCPConnectionHandler
-	Padding          bool
-	Brutal           BrutalOptions
+func (c *Client) Close() error {
+	fmt.Println("Closing mux client")
+	return nil
 }
 
-func NewService(options ServiceOptions) (*Service, error) {
-	return &Service{
-		newStreamContext: options.NewStreamContext,
-		logger:           options.Logger,
-		handler:          options.Handler,
-		padding:          options.Padding,
-		brutal:           options.Brutal,
-	}, nil
-}
+// Placeholder implementations for compatibility
+type Service struct{}
+type ServiceOptions struct{}
 
+func NewService(options ServiceOptions) (*Service, error) { return &Service{}, nil }
 func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	return s.handler.NewConnection(ctx, conn, metadata)
+	return nil
 }
 
 var Destination = M.Socksaddr{Fqdn: "inverse-mux"}
@@ -312,34 +326,15 @@ type StreamResponse struct {
 	Message string
 }
 
-func ReadStreamRequest(reader io.Reader) (*StreamRequest, error) {
-	return &StreamRequest{}, nil
-}
-
-func ReadStreamResponse(reader io.Reader) (*StreamResponse, error) {
-	return &StreamResponse{}, nil
-}
-
-func WriteBrutalRequest(writer io.Writer, receiveBPS uint64) error {
-	return nil
-}
-
-func ReadBrutalRequest(reader io.Reader) (uint64, error) {
-	return 0, nil
-}
-
+func ReadStreamRequest(reader io.Reader) (*StreamRequest, error)   { return &StreamRequest{}, nil }
+func ReadStreamResponse(reader io.Reader) (*StreamResponse, error) { return &StreamResponse{}, nil }
+func WriteBrutalRequest(writer io.Writer, receiveBPS uint64) error { return nil }
+func ReadBrutalRequest(reader io.Reader) (uint64, error)           { return 0, nil }
 func WriteBrutalResponse(writer io.Writer, receiveBPS uint64, ok bool, message string) error {
 	return nil
 }
+func ReadBrutalResponse(reader io.Reader) (uint64, error) { return 0, nil }
 
-func ReadBrutalResponse(reader io.Reader) (uint64, error) {
-	return 0, nil
-}
+const BrutalAvailable = false
 
-const (
-	BrutalAvailable = false
-)
-
-func SetBrutalOptions(conn net.Conn, sendBPS uint64) error {
-	return nil
-}
+func SetBrutalOptions(conn net.Conn, sendBPS uint64) error { return nil }
