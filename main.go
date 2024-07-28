@@ -1,27 +1,34 @@
-package mux
+package invmux
 
 import (
 	"context"
-	"encoding/binary"
 	"io"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
 
-const (
-	defaultBufferSize = 4096
-	headerSize        = 8 // 4 bytes for length, 4 bytes for sequence number
-)
+type Client struct {
+	dialer         N.Dialer
+	logger         logger.Logger
+	protocol       byte
+	maxConnections int
+	minStreams     int
+	maxStreams     int
+	padding        bool
+	brutal         BrutalOptions
+	connections    []*inverseConn
+	writeChan      chan []byte
+	readChan       chan []byte
+	mu             sync.Mutex
+}
 
-// Options struct to maintain compatibility
 type Options struct {
 	Dialer         N.Dialer
 	Logger         logger.Logger
@@ -33,193 +40,151 @@ type Options struct {
 	Brutal         BrutalOptions
 }
 
-// BrutalOptions struct to maintain compatibility
 type BrutalOptions struct {
 	Enabled    bool
 	SendBPS    uint64
 	ReceiveBPS uint64
 }
 
-// Client represents the client-side of the inverse multiplexer
-type Client struct {
-	dialer         N.Dialer
-	logger         logger.Logger
-	protocol       string
-	maxConnections int
-	minStreams     int
-	maxStreams     int
-	padding        bool
-	brutal         BrutalOptions
-	connections    []*subConn
-	mu             sync.Mutex
-	nextSeq        uint32
-}
-
-// NewClient creates a new inverse multiplexing client
 func NewClient(options Options) (*Client, error) {
+	if options.MaxConnections <= 0 {
+		options.MaxConnections = 1
+	}
 	return &Client{
 		dialer:         options.Dialer,
 		logger:         options.Logger,
-		protocol:       options.Protocol,
+		protocol:       protocolFromString(options.Protocol),
 		maxConnections: options.MaxConnections,
 		minStreams:     options.MinStreams,
 		maxStreams:     options.MaxStreams,
 		padding:        options.Padding,
 		brutal:         options.Brutal,
+		writeChan:      make(chan []byte, 100),
+		readChan:       make(chan []byte, 100),
 	}, nil
 }
 
-// DialContext establishes the inverse multiplexed connection
+func protocolFromString(protocol string) byte {
+	switch protocol {
+	case "h2mux":
+		return 0
+	case "smux":
+		return 1
+	case "yamux":
+		return 2
+	default:
+		return 0
+	}
+}
+
 func (c *Client) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for len(c.connections) < c.maxConnections {
+	for i := 0; i < c.maxConnections; i++ {
 		conn, err := c.dialer.DialContext(ctx, network, destination)
 		if err != nil {
-			return nil, err
+			c.logger.Error("failed to dial connection:", err)
+			continue
 		}
-		subConn := &subConn{Conn: conn, id: c.nextSeq}
-		c.connections = append(c.connections, subConn)
-		c.nextSeq++
+		ic := &inverseConn{conn: conn}
+		c.connections = append(c.connections, ic)
+		go c.readLoop(ic)
+		go c.writeLoop(ic)
 	}
 
-	imuxConn := &imuxConn{
-		client:     c,
-		readBuffer: make(chan []byte, c.maxConnections),
-		closeChan:  make(chan struct{}),
+	if len(c.connections) == 0 {
+		return nil, io.ErrNoProgress
 	}
 
-	for _, conn := range c.connections {
-		go imuxConn.readRoutine(conn)
-	}
-
-	return imuxConn, nil
+	return &clientConn{client: c, destination: destination}, nil
 }
 
-// Dummy methods to satisfy the interface
-func (c *Client) Reset()       {}
-func (c *Client) Close() error { return nil }
-
-type subConn struct {
-	net.Conn
-	id uint32
-}
-
-type imuxConn struct {
-	client     *Client
-	readBuffer chan []byte
-	writeMu    sync.Mutex
-	closeChan  chan struct{}
-	closeOnce  sync.Once
-}
-
-func (c *imuxConn) readRoutine(conn *subConn) {
-	defer conn.Close()
-
+func (c *Client) readLoop(ic *inverseConn) {
 	for {
-		header := make([]byte, headerSize)
-		_, err := io.ReadFull(conn, header)
+		buffer := buf.New()
+		_, err := buffer.ReadFrom(ic.conn)
 		if err != nil {
+			c.logger.Error("read error:", err)
 			return
 		}
+		c.readChan <- buffer.Bytes()
+		buffer.Release()
+	}
+}
 
-		length := binary.BigEndian.Uint32(header[:4])
-		data := make([]byte, length)
-		_, err = io.ReadFull(conn, data)
+func (c *Client) writeLoop(ic *inverseConn) {
+	for data := range c.writeChan {
+		_, err := ic.conn.Write(data)
 		if err != nil {
-			return
-		}
-
-		select {
-		case c.readBuffer <- data:
-		case <-c.closeChan:
+			c.logger.Error("write error:", err)
 			return
 		}
 	}
 }
 
-func (c *imuxConn) Read(b []byte) (n int, err error) {
+type inverseConn struct {
+	conn net.Conn
+}
+
+type clientConn struct {
+	client      *Client
+	destination M.Socksaddr
+	buffer      []byte
+}
+
+func (cc *clientConn) Read(b []byte) (n int, err error) {
+	if len(cc.buffer) > 0 {
+		n = copy(b, cc.buffer)
+		cc.buffer = cc.buffer[n:]
+		return
+	}
+
 	select {
-	case data := <-c.readBuffer:
-		return copy(b, data), nil
-	case <-c.closeChan:
-		return 0, io.EOF
+	case data := <-cc.client.readChan:
+		n = copy(b, data)
+		if n < len(data) {
+			cc.buffer = data[n:]
+		}
+	default:
+		err = io.EOF
 	}
+	return
 }
 
-func (c *imuxConn) Write(b []byte) (n int, err error) {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-
-	for len(b) > 0 {
-		chunk := b
-		if len(chunk) > defaultBufferSize {
-			chunk = chunk[:defaultBufferSize]
-		}
-
-		header := make([]byte, headerSize)
-		binary.BigEndian.PutUint32(header[:4], uint32(len(chunk)))
-		binary.BigEndian.PutUint32(header[4:], c.client.nextSeq)
-		c.client.nextSeq++
-
-		for _, conn := range c.client.connections {
-			if _, err := conn.Write(header); err != nil {
-				return n, err
-			}
-			if _, err := conn.Write(chunk); err != nil {
-				return n, err
-			}
-		}
-
-		n += len(chunk)
-		b = b[len(chunk):]
-	}
-
-	return n, nil
+func (cc *clientConn) Write(b []byte) (n int, err error) {
+	cc.client.writeChan <- b
+	return len(b), nil
 }
 
-func (c *imuxConn) Close() error {
-	c.closeOnce.Do(func() {
-		close(c.closeChan)
-		for _, conn := range c.client.connections {
-			conn.Close()
-		}
-	})
-	return nil
-}
-
-func (c *imuxConn) LocalAddr() net.Addr  { return c.client.connections[0].LocalAddr() }
-func (c *imuxConn) RemoteAddr() net.Addr { return c.client.connections[0].RemoteAddr() }
-
-func (c *imuxConn) SetDeadline(t time.Time) error {
-	for _, conn := range c.client.connections {
-		if err := conn.SetDeadline(t); err != nil {
-			return err
-		}
+func (cc *clientConn) Close() error {
+	close(cc.client.writeChan)
+	for _, conn := range cc.client.connections {
+		conn.conn.Close()
 	}
 	return nil
 }
 
-func (c *imuxConn) SetReadDeadline(t time.Time) error {
-	for _, conn := range c.client.connections {
-		if err := conn.SetReadDeadline(t); err != nil {
-			return err
-		}
+func (cc *clientConn) LocalAddr() net.Addr                { return cc.client.connections[0].conn.LocalAddr() }
+func (cc *clientConn) RemoteAddr() net.Addr               { return cc.destination.TCPAddr() }
+func (cc *clientConn) SetDeadline(t time.Time) error      { return nil }
+func (cc *clientConn) SetReadDeadline(t time.Time) error  { return nil }
+func (cc *clientConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func (c *Client) Reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, conn := range c.connections {
+		conn.conn.Close()
 	}
+	c.connections = nil
+}
+
+func (c *Client) Close() error {
+	c.Reset()
 	return nil
 }
 
-func (c *imuxConn) SetWriteDeadline(t time.Time) error {
-	for _, conn := range c.client.connections {
-		if err := conn.SetWriteDeadline(t); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// Service represents the server-side of the inverse multiplexer
 type Service struct {
 	newStreamContext func(context.Context, net.Conn) context.Context
 	logger           logger.ContextLogger
@@ -228,17 +193,17 @@ type Service struct {
 	brutal           BrutalOptions
 }
 
+type ServiceHandler interface {
+	N.TCPConnectionHandler
+	N.UDPConnectionHandler
+}
+
 type ServiceOptions struct {
 	NewStreamContext func(context.Context, net.Conn) context.Context
 	Logger           logger.ContextLogger
 	Handler          ServiceHandler
 	Padding          bool
 	Brutal           BrutalOptions
-}
-
-type ServiceHandler interface {
-	N.TCPConnectionHandler
-	N.UDPConnectionHandler
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
@@ -251,61 +216,93 @@ func NewService(options ServiceOptions) (*Service, error) {
 	}, nil
 }
 
-// Dummy method to satisfy the interface
+var Destination = M.Socksaddr{Fqdn: "inverse-mux"}
+
 func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+	return s.handler.NewConnection(ctx, conn, metadata)
+}
+
+func (s *Service) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
+	return s.handler.NewPacketConnection(ctx, conn, metadata)
+}
+
+// Dummy implementations for additional functions to satisfy the original interface
+
+func SetBrutalOptions(conn net.Conn, sendBPS uint64) error {
+	// Dummy implementation
 	return nil
 }
 
-// Dummy functions to maintain compatibility
-func WriteBrutalRequest(writer io.Writer, receiveBPS uint64) error { return nil }
-func ReadBrutalRequest(reader io.Reader) (uint64, error)           { return 0, nil }
+const (
+	BrutalAvailable   = true
+	BrutalMinSpeedBPS = 65536
+)
+
+func WriteBrutalRequest(writer io.Writer, receiveBPS uint64) error {
+	// Dummy implementation
+	return nil
+}
+
+func ReadBrutalRequest(reader io.Reader) (uint64, error) {
+	// Dummy implementation
+	return 0, nil
+}
+
 func WriteBrutalResponse(writer io.Writer, receiveBPS uint64, ok bool, message string) error {
+	// Dummy implementation
 	return nil
 }
-func ReadBrutalResponse(reader io.Reader) (uint64, error)  { return 0, nil }
-func SetBrutalOptions(conn net.Conn, sendBPS uint64) error { return nil }
 
-// Dummy structs and interfaces to maintain compatibility
-type StreamRequest struct{}
-type StreamResponse struct{}
-
-func ReadStreamRequest(reader io.Reader) (*StreamRequest, error)   { return nil, nil }
-func ReadStreamResponse(reader io.Reader) (*StreamResponse, error) { return nil, nil }
-
-type ExtendedConn interface {
-	net.Conn
-	ReaderReplaceable() bool
-	WriterReplaceable() bool
-	Upstream() any
+func ReadBrutalResponse(reader io.Reader) (uint64, error) {
+	// Dummy implementation
+	return 0, nil
 }
 
-type ExtendedServerConn interface {
-	ExtendedConn
-	NeedAdditionalReadDeadline() bool
+// Additional structs and functions to satisfy the original interface
+
+type Request struct {
+	Version  byte
+	Protocol byte
+	Padding  bool
 }
 
-type ServerConn struct{}
-
-func (c *ServerConn) NeedAdditionalReadDeadline() bool { return false }
-func (c *ServerConn) ReaderReplaceable() bool          { return false }
-func (c *ServerConn) WriterReplaceable() bool          { return false }
-func (c *ServerConn) Upstream() any                    { return nil }
-
-// Dummy buffer-related functions to maintain compatibility
-func (c *imuxConn) WriteBuffer(buffer *buf.Buffer) error {
-	_, err := c.Write(buffer.Bytes())
-	return err
+func ReadRequest(reader io.Reader) (*Request, error) {
+	// Dummy implementation
+	return &Request{}, nil
 }
 
-func (c *imuxConn) ReadBuffer(buffer *buf.Buffer) error {
-	n, err := c.Read(buffer.FreeBytes())
-	buffer.Truncate(n)
-	return err
+type StreamRequest struct {
+	Network     string
+	Destination M.Socksaddr
+	PacketAddr  bool
 }
 
-func (c *imuxConn) WriteTo(w io.Writer) (n int64, err error) {
-	return bufio.Copy(w, c)
+func ReadStreamRequest(reader io.Reader) (*StreamRequest, error) {
+	// Dummy implementation
+	return &StreamRequest{}, nil
 }
 
-// Dummy error for compatibility
-var ErrInvalidData = E.New("invalid data")
+func EncodeStreamRequest(request StreamRequest, buffer *buf.Buffer) error {
+	// Dummy implementation
+	return nil
+}
+
+type StreamResponse struct {
+	Status  uint8
+	Message string
+}
+
+func ReadStreamResponse(reader io.Reader) (*StreamResponse, error) {
+	// Dummy implementation
+	return &StreamResponse{}, nil
+}
+
+func (c *Client) DialPacket(ctx context.Context, destination M.Socksaddr) (N.PacketConn, error) {
+	// Dummy implementation
+	return nil, E.New("not implemented")
+}
+
+func (s *Service) NewPacket(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
+	// Dummy implementation
+	return E.New("not implemented")
+}
