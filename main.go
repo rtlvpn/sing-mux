@@ -66,7 +66,6 @@ func NewClient(options Options) (*Client, error) {
 		brutal:         options.Brutal,
 		chunkSize:      defaultChunkSize,
 	}, nil
-
 }
 
 type chunk struct {
@@ -85,18 +84,18 @@ type imuxConn struct {
 	nextWriteID  uint32
 	readBuffer   map[uint32][]byte
 	readBufferMu sync.Mutex
+	wg           sync.WaitGroup
+	mu           sync.Mutex
+	isClosed     bool
 }
 
 func (c *Client) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	fmt.Printf("DialContext called for network: %s, destination: %s\n", network, destination.String())
-
 	return c.dialIMUXConn(ctx, network, destination), nil
-
 }
 
 func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	fmt.Printf("ListenPacket called for destination: %s\n", destination.String())
-
 	return &imuxPacketConn{
 		imuxConn: c.dialIMUXConn(ctx, "udp", destination),
 	}, nil
@@ -142,52 +141,63 @@ func (c *Client) dialIMUXConn(ctx context.Context, network string, destination M
 }
 
 func (c *imuxConn) readRoutine(index int) {
+	c.wg.Add(1)
+	defer c.wg.Done()
 	c.client.logger.Debug("Starting read routine for connection", index)
 	fmt.Printf("Starting read routine for connection %d\n", index)
 	headerBuf := make([]byte, chunkHeaderSize)
 	for {
-		_, err := io.ReadFull(c.conns[index], headerBuf)
-		if err != nil {
-			if err != io.EOF {
-				c.client.logger.Error("Read header error:", err, "connection:", index)
-				fmt.Printf("Read header error: %v, connection: %d\n", err, index)
-			} else {
-				c.client.logger.Debug("EOF reached for connection", index)
-				fmt.Printf("EOF reached for connection %d\n", index)
-			}
-			return
-		}
-
-		id := binary.BigEndian.Uint32(headerBuf[:4])
-		length := binary.BigEndian.Uint32(headerBuf[4:])
-
-		c.client.logger.Debug("Received chunk header - ID:", id, "Length:", length, "Connection:", index)
-		fmt.Printf("Received chunk header - ID: %d, Length: %d, Connection: %d\n", id, length, index)
-
-		data := make([]byte, length)
-		_, err = io.ReadFull(c.conns[index], data)
-		if err != nil {
-			c.client.logger.Error("Read data error:", err, "connection:", index)
-			fmt.Printf("Read data error: %v, connection: %d\n", err, index)
-			return
-		}
-
-		c.client.logger.Debug("Received chunk data - ID:", id, "Length:", len(data), "Connection:", index)
-		fmt.Printf("Received chunk data - ID: %d, Length: %d, Connection: %d\n", id, len(data), index)
-
 		select {
-		case c.readChan <- chunk{id: id, data: data}:
-			c.client.logger.Debug("Chunk sent to read channel - ID:", id, "Connection:", index)
-			fmt.Printf("Chunk sent to read channel - ID: %d, Connection: %d\n", id, index)
 		case <-c.closeChan:
 			c.client.logger.Debug("Read routine closing for connection", index)
 			fmt.Printf("Read routine closing for connection %d\n", index)
 			return
+		default:
+			_, err := io.ReadFull(c.conns[index], headerBuf)
+			if err != nil {
+				if err != io.EOF {
+					c.client.logger.Error("Read header error:", err, "connection:", index)
+					fmt.Printf("Read header error: %v, connection: %d\n", err, index)
+				} else {
+					c.client.logger.Debug("EOF reached for connection", index)
+					fmt.Printf("EOF reached for connection %d\n", index)
+				}
+				return
+			}
+
+			id := binary.BigEndian.Uint32(headerBuf[:4])
+			length := binary.BigEndian.Uint32(headerBuf[4:])
+
+			c.client.logger.Debug("Received chunk header - ID:", id, "Length:", length, "Connection:", index)
+			fmt.Printf("Received chunk header - ID: %d, Length: %d, Connection: %d\n", id, length, index)
+
+			data := make([]byte, length)
+			_, err = io.ReadFull(c.conns[index], data)
+			if err != nil {
+				c.client.logger.Error("Read data error:", err, "connection:", index)
+				fmt.Printf("Read data error: %v, connection: %d\n", err, index)
+				return
+			}
+
+			c.client.logger.Debug("Received chunk data - ID:", id, "Length:", len(data), "Connection:", index)
+			fmt.Printf("Received chunk data - ID: %d, Length: %d, Connection: %d\n", id, len(data), index)
+
+			select {
+			case c.readChan <- chunk{id: id, data: data}:
+				c.client.logger.Debug("Chunk sent to read channel - ID:", id, "Connection:", index)
+				fmt.Printf("Chunk sent to read channel - ID: %d, Connection: %d\n", id, index)
+			case <-c.closeChan:
+				c.client.logger.Debug("Read routine closing for connection", index)
+				fmt.Printf("Read routine closing for connection %d\n", index)
+				return
+			}
 		}
 	}
 }
 
 func (c *imuxConn) writeRoutine(index int) {
+	c.wg.Add(1)
+	defer c.wg.Done()
 	c.client.logger.Debug("Starting write routine for connection", index)
 	fmt.Printf("Starting write routine for connection %d\n", index)
 	for {
@@ -226,6 +236,13 @@ func (c *imuxConn) writeRoutine(index int) {
 }
 
 func (c *imuxConn) Read(b []byte) (n int, err error) {
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return 0, io.EOF
+	}
+	c.mu.Unlock()
+
 	c.client.logger.Debug("Read called, buffer size:", len(b))
 	fmt.Printf("Read called, buffer size: %d\n", len(b))
 	for {
@@ -261,6 +278,13 @@ func (c *imuxConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *imuxConn) Write(b []byte) (n int, err error) {
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return 0, io.ErrClosedPipe
+	}
+	c.mu.Unlock()
+
 	c.client.logger.Debug("Write called, data length:", len(b))
 	fmt.Printf("Write called, data length: %d\n", len(b))
 	remaining := len(b)
@@ -295,7 +319,13 @@ func (c *imuxConn) Close() error {
 	c.client.logger.Info("Closing IMUX connection")
 	fmt.Println("Closing IMUX connection")
 	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.isClosed = true
+		c.mu.Unlock()
+
 		close(c.closeChan)
+		c.wg.Wait() // Wait for all goroutines to finish
+
 		for i, conn := range c.conns {
 			if conn != nil {
 				c.client.logger.Debug("Closing sub-connection", i)
@@ -356,56 +386,203 @@ func NewService(options ServiceOptions) (*Service, error) {
 }
 
 func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	return s.handler.NewConnection(ctx, conn, metadata)
+	s.logger.InfoContext(ctx, "New IMUX connection from ", metadata.Source)
+	fmt.Printf("New IMUX connection from %s\n", metadata.Source)
+
+	imuxConn := &imuxServerConn{
+		Service:   s,
+		conn:      conn,
+		metadata:  metadata,
+		readChan:  make(chan chunk, defaultMaxConnections),
+		closeChan: make(chan struct{}),
+	}
+
+	go imuxConn.readRoutine()
+	go imuxConn.writeRoutine()
+
+	return s.handler.NewConnection(ctx, imuxConn, metadata)
 }
 
-var Destination = M.Socksaddr{Fqdn: "inverse-mux"}
-
-const (
-	ProtocolH2Mux = iota
-	ProtocolSmux
-	ProtocolYAMux
-)
-
-type StreamRequest struct {
-	Network     string
-	Destination M.Socksaddr
-	PacketAddr  bool
+type imuxServerConn struct {
+	*Service
+	conn         net.Conn
+	metadata     M.Metadata
+	readChan     chan chunk
+	closeChan    chan struct{}
+	nextReadID   uint32
+	nextWriteID  uint32
+	readBuffer   map[uint32][]byte
+	readBufferMu sync.Mutex
+	wg           sync.WaitGroup
+	mu           sync.Mutex
+	isClosed     bool
 }
 
-type StreamResponse struct {
-	Status  uint8
-	Message string
+func (c *imuxServerConn) readRoutine() {
+	c.wg.Add(1)
+	defer c.wg.Done()
+	headerBuf := make([]byte, chunkHeaderSize)
+	for {
+		select {
+		case <-c.closeChan:
+			c.logger.Debug("Server read routine closing")
+			fmt.Println("Server read routine closing")
+			return
+		default:
+			_, err := io.ReadFull(c.conn, headerBuf)
+			if err != nil {
+				if err != io.EOF {
+					c.logger.Error("Server read header error:", err)
+					fmt.Printf("Server read header error: %v\n", err)
+				}
+				return
+			}
+
+			id := binary.BigEndian.Uint32(headerBuf[:4])
+			length := binary.BigEndian.Uint32(headerBuf[4:])
+
+			data := make([]byte, length)
+			_, err = io.ReadFull(c.conn, data)
+			if err != nil {
+				c.logger.Error("Server read data error:", err)
+				fmt.Printf("Server read data error: %v\n", err)
+				return
+			}
+
+			select {
+			case c.readChan <- chunk{id: id, data: data}:
+			case <-c.closeChan:
+				return
+			}
+		}
+	}
 }
 
-func ReadStreamRequest(reader io.Reader) (*StreamRequest, error) {
-	return &StreamRequest{}, nil
+func (c *imuxServerConn) writeRoutine() {
+	c.wg.Add(1)
+	defer c.wg.Done()
+	for {
+		select {
+		case <-c.closeChan:
+			c.logger.Debug("Server write routine closing")
+			fmt.Println("Server write routine closing")
+			return
+		default:
+			chunk := <-c.readChan
+			header := make([]byte, chunkHeaderSize)
+			binary.BigEndian.PutUint32(header[:4], chunk.id)
+			binary.BigEndian.PutUint32(header[4:], uint32(len(chunk.data)))
+
+			_, err := c.conn.Write(header)
+			if err != nil {
+				c.logger.Error("Server write header error:", err)
+				fmt.Printf("Server write header error: %v\n", err)
+				return
+			}
+
+			_, err = c.conn.Write(chunk.data)
+			if err != nil {
+				c.logger.Error("Server write data error:", err)
+				fmt.Printf("Server write data error: %v\n", err)
+				return
+			}
+		}
+	}
 }
 
-func ReadStreamResponse(reader io.Reader) (*StreamResponse, error) {
-	return &StreamResponse{}, nil
+func (c *imuxServerConn) Read(b []byte) (n int, err error) {
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return 0, io.EOF
+	}
+	c.mu.Unlock()
+
+	for {
+		c.readBufferMu.Lock()
+		if data, ok := c.readBuffer[c.nextReadID]; ok {
+			n = copy(b, data)
+			if n < len(data) {
+				c.readBuffer[c.nextReadID] = data[n:]
+			} else {
+				delete(c.readBuffer, c.nextReadID)
+				c.nextReadID++
+			}
+			c.readBufferMu.Unlock()
+			return
+		}
+		c.readBufferMu.Unlock()
+
+		select {
+		case chunk := <-c.readChan:
+			c.readBufferMu.Lock()
+			c.readBuffer[chunk.id] = chunk.data
+			c.readBufferMu.Unlock()
+		case <-c.closeChan:
+			return 0, io.EOF
+		}
+	}
 }
 
-func WriteBrutalRequest(writer io.Writer, receiveBPS uint64) error {
-	return nil
+func (c *imuxServerConn) Write(b []byte) (n int, err error) {
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return 0, io.ErrClosedPipe
+	}
+	c.mu.Unlock()
+
+	remaining := len(b)
+	for remaining > 0 {
+		chunkSize := defaultChunkSize
+		if remaining < chunkSize {
+			chunkSize = remaining
+		}
+		chunk := chunk{
+			id:   c.nextWriteID,
+			data: b[n : n+chunkSize],
+		}
+		header := make([]byte, chunkHeaderSize)
+		binary.BigEndian.PutUint32(header[:4], chunk.id)
+		binary.BigEndian.PutUint32(header[4:], uint32(chunkSize))
+
+		_, err := c.conn.Write(header)
+		if err != nil {
+			return n, err
+		}
+
+		_, err = c.conn.Write(chunk.data)
+		if err != nil {
+			return n, err
+		}
+
+		n += chunkSize
+		remaining -= chunkSize
+		c.nextWriteID++
+	}
+	return n, nil
 }
 
-func ReadBrutalRequest(reader io.Reader) (uint64, error) {
-	return 0, nil
+func (c *imuxServerConn) Close() error {
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.isClosed = true
+	c.mu.Unlock()
+
+	close(c.closeChan)
+	c.wg.Wait()
+	return c.conn.Close()
 }
 
-func WriteBrutalResponse(writer io.Writer, receiveBPS uint64, ok bool, message string) error {
-	return nil
-}
+func (c *imuxServerConn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
+func (c *imuxServerConn) RemoteAddr() net.Addr               { return c.conn.RemoteAddr() }
+func (c *imuxServerConn) SetDeadline(t time.Time) error      { return c.conn.SetDeadline(t) }
+func (c *imuxServerConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
+func (c *imuxServerConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }
 
-func ReadBrutalResponse(reader io.Reader) (uint64, error) {
-	return 0, nil
-}
-
-const (
-	BrutalAvailable = false
-)
-
-func SetBrutalOptions(conn net.Conn, sendBPS uint64) error {
-	return nil
+func (s *Service) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
+	return E.New("packet connection is not supported in IMUX")
 }
