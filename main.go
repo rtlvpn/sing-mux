@@ -1,4 +1,4 @@
-package imux
+package mux
 
 import (
 	"context"
