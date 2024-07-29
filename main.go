@@ -2,307 +2,474 @@ package mux
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
 
+const (
+	DefaultMaxConnections = 4
+	DefaultMinStreams     = 2
+	DefaultMaxStreams     = 8
+	DefaultChunkSize      = 16384
+	DefaultKeepAlive      = 30 * time.Second
+	DefaultIdleTimeout    = 5 * time.Minute
+)
+
 type Client struct {
 	dialer         N.Dialer
 	logger         logger.Logger
-	protocol       byte
 	maxConnections int
 	minStreams     int
 	maxStreams     int
-	padding        bool
-	brutal         BrutalOptions
-	connections    []*inverseConn
-	writeChan      chan []byte
-	readChan       chan []byte
-	mu             sync.Mutex
+	chunkSize      int
+	keepAlive      time.Duration
+	idleTimeout    time.Duration
+	sessions       []*Session
+	sessionMu      sync.Mutex
 }
 
 type Options struct {
 	Dialer         N.Dialer
 	Logger         logger.Logger
-	Protocol       string
 	MaxConnections int
 	MinStreams     int
 	MaxStreams     int
-	Padding        bool
-	Brutal         BrutalOptions
-}
-
-type BrutalOptions struct {
-	Enabled    bool
-	SendBPS    uint64
-	ReceiveBPS uint64
+	ChunkSize      int
+	KeepAlive      time.Duration
+	IdleTimeout    time.Duration
 }
 
 func NewClient(options Options) (*Client, error) {
-	if options.MaxConnections <= 0 {
-		options.MaxConnections = 1
+	if options.MaxConnections == 0 {
+		options.MaxConnections = DefaultMaxConnections
+	}
+	if options.MinStreams == 0 {
+		options.MinStreams = DefaultMinStreams
+	}
+	if options.MaxStreams == 0 {
+		options.MaxStreams = DefaultMaxStreams
+	}
+	if options.ChunkSize == 0 {
+		options.ChunkSize = DefaultChunkSize
+	}
+	if options.KeepAlive == 0 {
+		options.KeepAlive = DefaultKeepAlive
+	}
+	if options.IdleTimeout == 0 {
+		options.IdleTimeout = DefaultIdleTimeout
 	}
 	return &Client{
 		dialer:         options.Dialer,
 		logger:         options.Logger,
-		protocol:       protocolFromString(options.Protocol),
 		maxConnections: options.MaxConnections,
 		minStreams:     options.MinStreams,
 		maxStreams:     options.MaxStreams,
-		padding:        options.Padding,
-		brutal:         options.Brutal,
-		writeChan:      make(chan []byte, 100),
-		readChan:       make(chan []byte, 100),
+		chunkSize:      options.ChunkSize,
+		keepAlive:      options.KeepAlive,
+		idleTimeout:    options.IdleTimeout,
 	}, nil
-}
-
-func protocolFromString(protocol string) byte {
-	switch protocol {
-	case "h2mux":
-		return 0
-	case "smux":
-		return 1
-	case "yamux":
-		return 2
-	default:
-		return 0
-	}
 }
 
 func (c *Client) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
 
-	for i := 0; i < c.maxConnections; i++ {
-		conn, err := c.dialer.DialContext(ctx, network, destination)
+	var session *Session
+	if len(c.sessions) < c.maxConnections {
+		newSession, err := c.createSession(ctx, destination)
 		if err != nil {
-			c.logger.Error("failed to dial connection:", err)
-			continue
+			return nil, err
 		}
-		ic := &inverseConn{conn: conn}
-		c.connections = append(c.connections, ic)
-		go c.readLoop(ic)
-		go c.writeLoop(ic)
+		c.sessions = append(c.sessions, newSession)
+		session = newSession
+	} else {
+		session = c.leastLoadedSession()
 	}
 
-	if len(c.connections) == 0 {
-		return nil, io.ErrNoProgress
+	stream, err := session.OpenStream()
+	if err != nil {
+		return nil, err
 	}
 
-	return &clientConn{client: c, destination: destination}, nil
+	return stream, nil
 }
 
-func (c *Client) readLoop(ic *inverseConn) {
+func (c *Client) createSession(ctx context.Context, destination M.Socksaddr) (*Session, error) {
+	conn, err := c.dialer.DialContext(ctx, "tcp", destination)
+	if err != nil {
+		return nil, err
+	}
+	return NewSession(conn, c.chunkSize, c.maxStreams, c.keepAlive, c.idleTimeout, c.logger), nil
+}
+
+func (c *Client) leastLoadedSession() *Session {
+	var leastLoaded *Session
+	minStreams := c.maxStreams
+
+	for _, session := range c.sessions {
+		if session.StreamCount() < minStreams {
+			leastLoaded = session
+			minStreams = session.StreamCount()
+		}
+	}
+
+	return leastLoaded
+}
+
+type Session struct {
+	conn         net.Conn
+	streams      map[uint32]*Stream
+	nextID       uint32
+	chunkSize    int
+	maxStreams   int
+	keepAlive    time.Duration
+	idleTimeout  time.Duration
+	logger       logger.Logger
+	mu           sync.Mutex
+	writeChan    chan *Chunk
+	closeChan    chan struct{}
+	lastActivity time.Time
+}
+
+func NewSession(conn net.Conn, chunkSize, maxStreams int, keepAlive, idleTimeout time.Duration, logger logger.Logger) *Session {
+	s := &Session{
+		conn:         conn,
+		streams:      make(map[uint32]*Stream),
+		chunkSize:    chunkSize,
+		maxStreams:   maxStreams,
+		keepAlive:    keepAlive,
+		idleTimeout:  idleTimeout,
+		logger:       logger,
+		writeChan:    make(chan *Chunk, 50),
+		closeChan:    make(chan struct{}),
+		lastActivity: time.Now(),
+	}
+	go s.readLoop()
+	go s.writeLoop()
+	go s.keepAliveLoop()
+	go s.idleTimeoutLoop()
+	return s
+}
+
+func (s *Session) OpenStream() (net.Conn, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.streams) >= s.maxStreams {
+		return nil, E.New("too many streams")
+	}
+
+	id := s.nextID
+	s.nextID++
+
+	stream := NewStream(id, s)
+	s.streams[id] = stream
+
+	s.lastActivity = time.Now()
+	return stream, nil
+}
+
+func (s *Session) StreamCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.streams)
+}
+
+func (s *Session) readLoop() {
+	header := make([]byte, 8)
 	for {
-		buffer := buf.New()
-		_, err := buffer.ReadFrom(ic.conn)
+		_, err := io.ReadFull(s.conn, header)
 		if err != nil {
-			c.logger.Error("read error:", err)
+			s.logger.Error("read error:", err)
+			s.Close()
 			return
 		}
-		c.readChan <- buffer.Bytes()
-		buffer.Release()
+
+		id := binary.BigEndian.Uint32(header[:4])
+		length := binary.BigEndian.Uint32(header[4:])
+
+		data := make([]byte, length)
+		_, err = io.ReadFull(s.conn, data)
+		if err != nil {
+			s.logger.Error("read error:", err)
+			s.Close()
+			return
+		}
+
+		s.mu.Lock()
+		s.lastActivity = time.Now()
+		if stream, ok := s.streams[id]; ok {
+			stream.readChan <- data
+		}
+		s.mu.Unlock()
 	}
 }
 
-func (c *Client) writeLoop(ic *inverseConn) {
-	for data := range c.writeChan {
-		_, err := ic.conn.Write(data)
-		if err != nil {
-			c.logger.Error("write error:", err)
+func (s *Session) writeLoop() {
+	for {
+		select {
+		case chunk := <-s.writeChan:
+			header := make([]byte, 8)
+			binary.BigEndian.PutUint32(header[:4], chunk.StreamID)
+			binary.BigEndian.PutUint32(header[4:], uint32(len(chunk.Data)))
+			_, err := s.conn.Write(append(header, chunk.Data...))
+			if err != nil {
+				s.logger.Error("write error:", err)
+				s.Close()
+				return
+			}
+			s.mu.Lock()
+			s.lastActivity = time.Now()
+			s.mu.Unlock()
+		case <-s.closeChan:
 			return
 		}
 	}
 }
 
-type inverseConn struct {
-	conn net.Conn
+func (s *Session) keepAliveLoop() {
+	ticker := time.NewTicker(s.keepAlive)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.mu.Lock()
+			if time.Since(s.lastActivity) >= s.keepAlive {
+				s.writeChan <- &Chunk{StreamID: 0, Data: []byte("keepalive")}
+			}
+			s.mu.Unlock()
+		case <-s.closeChan:
+			return
+		}
+	}
 }
 
-type clientConn struct {
-	client      *Client
-	destination M.Socksaddr
-	buffer      []byte
+func (s *Session) idleTimeoutLoop() {
+	ticker := time.NewTicker(s.idleTimeout / 2)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.mu.Lock()
+			if time.Since(s.lastActivity) >= s.idleTimeout {
+				s.logger.Info("session idle timeout")
+				s.Close()
+				s.mu.Unlock()
+				return
+			}
+			s.mu.Unlock()
+		case <-s.closeChan:
+			return
+		}
+	}
 }
 
-func (cc *clientConn) Read(b []byte) (n int, err error) {
-	if len(cc.buffer) > 0 {
-		n = copy(b, cc.buffer)
-		cc.buffer = cc.buffer[n:]
-		return
+func (s *Session) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		return nil
+	}
+
+	close(s.closeChan)
+	for _, stream := range s.streams {
+		stream.Close()
+	}
+	err := s.conn.Close()
+	s.conn = nil
+	return err
+}
+
+type Stream struct {
+	id       uint32
+	session  *Session
+	readChan chan []byte
+	readBuf  []byte
+	closed   bool
+	mu       sync.Mutex
+}
+
+func NewStream(id uint32, session *Session) *Stream {
+	return &Stream{
+		id:       id,
+		session:  session,
+		readChan: make(chan []byte, 10),
+	}
+}
+
+func (s *Stream) Read(p []byte) (int, error) {
+	if len(s.readBuf) > 0 {
+		n := copy(p, s.readBuf)
+		s.readBuf = s.readBuf[n:]
+		return n, nil
 	}
 
 	select {
-	case data := <-cc.client.readChan:
-		n = copy(b, data)
+	case data := <-s.readChan:
+		n := copy(p, data)
 		if n < len(data) {
-			cc.buffer = data[n:]
+			s.readBuf = data[n:]
 		}
-	default:
-		err = io.EOF
+		return n, nil
+	case <-time.After(30 * time.Second):
+		return 0, E.New("read timeout")
 	}
-	return
 }
 
-func (cc *clientConn) Write(b []byte) (n int, err error) {
-	cc.client.writeChan <- b
-	return len(b), nil
+func (s *Stream) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return 0, E.New("stream closed")
+	}
+
+	totalWritten := 0
+	for len(p) > 0 {
+		chunk := &Chunk{
+			StreamID: s.id,
+			Data:     p,
+		}
+		if len(p) > s.session.chunkSize {
+			chunk.Data = p[:s.session.chunkSize]
+			p = p[s.session.chunkSize:]
+		} else {
+			totalWritten += len(p)
+			p = nil
+		}
+		select {
+		case s.session.writeChan <- chunk:
+		case <-time.After(30 * time.Second):
+			return totalWritten, E.New("write timeout")
+		}
+	}
+
+	return totalWritten, nil
 }
 
-func (cc *clientConn) Close() error {
-	close(cc.client.writeChan)
-	for _, conn := range cc.client.connections {
-		conn.conn.Close()
+func (s *Stream) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil
 	}
+
+	s.closed = true
+	s.session.mu.Lock()
+	delete(s.session.streams, s.id)
+	s.session.mu.Unlock()
+	close(s.readChan)
 	return nil
 }
 
-func (cc *clientConn) LocalAddr() net.Addr                { return cc.client.connections[0].conn.LocalAddr() }
-func (cc *clientConn) RemoteAddr() net.Addr               { return cc.destination.TCPAddr() }
-func (cc *clientConn) SetDeadline(t time.Time) error      { return nil }
-func (cc *clientConn) SetReadDeadline(t time.Time) error  { return nil }
-func (cc *clientConn) SetWriteDeadline(t time.Time) error { return nil }
+func (s *Stream) LocalAddr() net.Addr                { return s.session.conn.LocalAddr() }
+func (s *Stream) RemoteAddr() net.Addr               { return s.session.conn.RemoteAddr() }
+func (s *Stream) SetDeadline(t time.Time) error      { return nil }
+func (s *Stream) SetReadDeadline(t time.Time) error  { return nil }
+func (s *Stream) SetWriteDeadline(t time.Time) error { return nil }
 
-func (c *Client) Reset() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, conn := range c.connections {
-		conn.conn.Close()
-	}
-	c.connections = nil
+type Chunk struct {
+	StreamID uint32
+	Data     []byte
 }
 
-func (c *Client) Close() error {
-	c.Reset()
-	return nil
-}
+// Server implementation
 
-type Service struct {
-	newStreamContext func(context.Context, net.Conn) context.Context
-	logger           logger.ContextLogger
-	handler          ServiceHandler
-	padding          bool
-	brutal           BrutalOptions
+type Server struct {
+	handler  ServiceHandler
+	logger   logger.Logger
+	sessions map[net.Conn]*Session
+	mu       sync.Mutex
 }
 
 type ServiceHandler interface {
-	N.TCPConnectionHandler
-	N.UDPConnectionHandler
+	NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error
 }
 
-type ServiceOptions struct {
-	NewStreamContext func(context.Context, net.Conn) context.Context
-	Logger           logger.ContextLogger
-	Handler          ServiceHandler
-	Padding          bool
-	Brutal           BrutalOptions
+func NewServer(handler ServiceHandler, logger logger.Logger) *Server {
+	return &Server{
+		handler:  handler,
+		logger:   logger,
+		sessions: make(map[net.Conn]*Session),
+	}
 }
 
-func NewService(options ServiceOptions) (*Service, error) {
-	return &Service{
-		newStreamContext: options.NewStreamContext,
-		logger:           options.Logger,
-		handler:          options.Handler,
-		padding:          options.Padding,
-		brutal:           options.Brutal,
-	}, nil
+func (s *Server) Serve(listener net.Listener) error {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return err
+		}
+		go s.handleConnection(conn)
+	}
 }
 
-var Destination = M.Socksaddr{Fqdn: "inverse-mux"}
+func (s *Server) handleConnection(conn net.Conn) {
+	session := NewSession(conn, DefaultChunkSize, DefaultMaxStreams, DefaultKeepAlive, DefaultIdleTimeout, s.logger)
+	s.mu.Lock()
+	s.sessions[conn] = session
+	s.mu.Unlock()
 
-func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	return s.handler.NewConnection(ctx, conn, metadata)
+	defer func() {
+		s.mu.Lock()
+		delete(s.sessions, conn)
+		s.mu.Unlock()
+		session.Close()
+	}()
+
+	for {
+		stream, err := session.AcceptStream()
+		if err != nil {
+			s.logger.Error("accept stream error:", err)
+			return
+		}
+		go s.handleStream(stream)
+	}
 }
 
-func (s *Service) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
-	return s.handler.NewPacketConnection(ctx, conn, metadata)
+func (s *Server) handleStream(stream *Stream) {
+	metadata := M.Metadata{
+		Source: M.SocksaddrFromNet(stream.RemoteAddr()),
+	}
+	err := s.handler.NewConnection(context.Background(), stream, metadata)
+	if err != nil {
+		s.logger.Error("handle connection error:", err)
+		stream.Close()
+	}
 }
 
-// Dummy implementations for additional functions to satisfy the original interface
+func (s *Session) AcceptStream() (*Stream, error) {
+	select {
+	case <-s.closeChan:
+		return nil, E.New("session closed")
+	default:
+	}
 
-func SetBrutalOptions(conn net.Conn, sendBPS uint64) error {
-	// Dummy implementation
-	return nil
-}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-const (
-	BrutalAvailable   = true
-	BrutalMinSpeedBPS = 65536
-)
+	if len(s.streams) >= s.maxStreams {
+		return nil, E.New("too many streams")
+	}
 
-func WriteBrutalRequest(writer io.Writer, receiveBPS uint64) error {
-	// Dummy implementation
-	return nil
-}
+	id := s.nextID
+	s.nextID++
 
-func ReadBrutalRequest(reader io.Reader) (uint64, error) {
-	// Dummy implementation
-	return 0, nil
-}
+	stream := NewStream(id, s)
+	s.streams[id] = stream
 
-func WriteBrutalResponse(writer io.Writer, receiveBPS uint64, ok bool, message string) error {
-	// Dummy implementation
-	return nil
-}
-
-func ReadBrutalResponse(reader io.Reader) (uint64, error) {
-	// Dummy implementation
-	return 0, nil
-}
-
-// Additional structs and functions to satisfy the original interface
-
-type Request struct {
-	Version  byte
-	Protocol byte
-	Padding  bool
-}
-
-func ReadRequest(reader io.Reader) (*Request, error) {
-	// Dummy implementation
-	return &Request{}, nil
-}
-
-type StreamRequest struct {
-	Network     string
-	Destination M.Socksaddr
-	PacketAddr  bool
-}
-
-func ReadStreamRequest(reader io.Reader) (*StreamRequest, error) {
-	// Dummy implementation
-	return &StreamRequest{}, nil
-}
-
-func EncodeStreamRequest(request StreamRequest, buffer *buf.Buffer) error {
-	// Dummy implementation
-	return nil
-}
-
-type StreamResponse struct {
-	Status  uint8
-	Message string
-}
-
-func ReadStreamResponse(reader io.Reader) (*StreamResponse, error) {
-	// Dummy implementation
-	return &StreamResponse{}, nil
-}
-
-func (c *Client) DialPacket(ctx context.Context, destination M.Socksaddr) (N.PacketConn, error) {
-	// Dummy implementation
-	return nil, E.New("not implemented")
-}
-
-func (s *Service) NewPacket(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
-	// Dummy implementation
-	return E.New("not implemented")
+	s.lastActivity = time.Now()
+	return stream, nil
 }
